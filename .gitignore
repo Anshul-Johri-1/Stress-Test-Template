@@ -1,0 +1,7 @@
+.build/
+input.txt
+expected_output.txt
+received_output.txt
+checker_log.txt
+debug_log.txt
+__pycache__/
