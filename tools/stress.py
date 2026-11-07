@@ -18,8 +18,9 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-BUILD = ROOT / ".build"
+ROOT = Path(__file__).resolve().parent.parent  # the folder with run.sh and your .cpp files
+BUILD = ROOT / ".build"  # compiled binaries, precompiled header (cache, safe to delete)
+FAIL = ROOT / "fail"  # last failing test; removed again when a full run passes
 ROLES = ("generator", "correct", "wrong", "checker")
 
 TTY = sys.stdout.isatty()
@@ -48,6 +49,17 @@ SIGNAL_HINTS = {
     "SIGFPE": "division by zero",
     "SIGKILL": "killed (out of memory?)",
 }
+
+
+def rel(path: Path) -> str:
+    """Short path for messages: relative to where you ran ./run.sh, e.g. fail/input.txt."""
+    path = Path(path).resolve()
+    for base in (Path.cwd(), ROOT):
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            pass
+    return str(path)
 
 
 def die(msg):
@@ -397,18 +409,22 @@ TITLES = {
 def report(f: Failure, tester: Tester, debug_build):
     where = f"test #{f.test}" + (f", seed {f.seed}" if f.seed is not None else "")
     print("\n" + RED(BOLD(f"✗ {TITLES[f.verdict]}")) + f" on {where}\n")
-    files = {"input.txt": f.inp, "expected_output.txt": f.exp or b"", "received_output.txt": f.got or b""}
-    for name, data in files.items():
-        (ROOT / name).write_bytes(data)
-    (ROOT / "checker_log.txt").write_text(f.msg + "\n")
+    shutil.rmtree(FAIL, ignore_errors=True)
+    FAIL.mkdir()
+    (FAIL / "input.txt").write_bytes(f.inp)
+    if f.exp is not None:
+        (FAIL / "expected.txt").write_bytes(f.exp)
+    if f.got is not None:
+        (FAIL / "received.txt").write_bytes(f.got)
+    (FAIL / "verdict.txt").write_text(f.msg + "\n")
 
     if f.verdict != "GEN":
-        block("Input", f.inp, "input.txt", max_lines=50)
+        block("Input", f.inp, "fail/input.txt", max_lines=50)
     if f.exp is not None:
-        block("Expected", f.exp, "expected_output.txt", f.exp_line, GREEN, numbered=True)
+        block("Expected", f.exp, "fail/expected.txt", f.exp_line, GREEN, numbered=True)
     if f.got is not None:
         block("Received" if f.verdict != "GEN" else "Generator output", f.got,
-              "received_output.txt" if f.verdict != "GEN" else None, f.got_line, RED, numbered=True)
+              "fail/received.txt" if f.verdict != "GEN" else None, f.got_line, RED, numbered=True)
     print(BOLD("── Verdict"))
     print("   " + f.msg.replace("\n", "\n   "))
     if f.stderr.strip():
@@ -420,7 +436,8 @@ def report(f: Failure, tester: Tester, debug_build):
         exe, _, err = debug_build.result()
         if exe:
             r = execute([str(exe)], f.inp, max(10.0, 10 * tester.a.time))
-            (ROOT / "debug_log.txt").write_bytes(r.err)
+            if r.err.strip():
+                (FAIL / "debug.txt").write_bytes(r.err)
             notes = []
             if r.status == "RE":
                 notes.append(YELLOW(f"debug build crashed: {r.detail}"))
@@ -432,13 +449,13 @@ def report(f: Failure, tester: Tester, debug_build):
                 for n in notes:
                     print("   " + n)
                 if r.err.strip():
-                    block("debug() / stderr", r.err, "debug_log.txt", max_lines=40)
+                    block("debug() / stderr", r.err, "fail/debug.txt", max_lines=40)
 
     print()
     if f.seed is not None:
-        print(DIM("Reproduce: ") + f"./run.sh -s {f.seed} 1" + DIM("   ·   re-run saved test: ") + "./run.sh -f input.txt")
+        print(DIM("Reproduce: ") + f"./run.sh -s {f.seed} 1" + DIM("   ·   re-run this test after a fix: ") + "./run.sh -f")
     else:
-        print(DIM("Re-run: ") + "./run.sh -f input.txt")
+        print(DIM("Re-run after a fix: ") + "./run.sh -f")
 
 
 def preview(inp, exp, got):
@@ -471,7 +488,8 @@ def parse_args():
                "  ./run.sh -e 1e-6         compare floats with 1e-6 abs/rel tolerance\n"
                "  ./run.sh -c              judge with checker.cpp (multiple valid answers)\n"
                "  ./run.sh -m 500          after a failure, try 500 more tests for a smaller one\n"
-               "  ./run.sh -f input.txt    run once on a saved input\n"
+               "  ./run.sh -f              re-run the last failing test (fail/input.txt)\n"
+               "  ./run.sh -f my.txt       run once on any input file\n"
                "  ./run.sh -- 100 5        pass '100 5' to the generator as argv[2], argv[3]\n"
                "\nnext problem: git restore .   (blank templates are committed)\n"
                "without correct.cpp/.py, wrong is only checked for crashes / TLE (and by -c checker).")
@@ -485,7 +503,8 @@ def parse_args():
     ap.add_argument("-i", "--icase", action="store_true", help="case-insensitive tokens (YES == yes)")
     ap.add_argument("-m", "--minimize", type=int, default=0, metavar="K",
                     help="after the first failure run K more tests and report the smallest failing input")
-    ap.add_argument("-f", "--file", type=Path, help="run once on this input file (no generator)")
+    ap.add_argument("-f", "--file", type=Path, nargs="?", const=FAIL / "input.txt",
+                    help="run once on this input file (default: fail/input.txt)")
     ap.add_argument("-q", "--quiet", action="store_true", help="don't preview the first test")
     a = ap.parse_args(argv)
     a.n = a.count if a.count is not None else a.n
@@ -498,6 +517,8 @@ def main():
     gen = None if a.file else find_source("generator")
     correct, wrong = find_source("correct"), find_source("wrong")
     checker = find_source("checker") if a.checker else None
+    if a.file and not a.file.exists():
+        die("No failing test saved yet. Run ./run.sh first." if a.file == FAIL / "input.txt" else f"{a.file} not found")
     if not wrong:
         die("wrong.cpp / wrong.py is missing or empty")
     if not a.file and not gen:
@@ -529,12 +550,10 @@ def main():
 
 
 def run_file(a, t: Tester, debug_build):
-    if not a.file.exists():
-        die(f"{a.file} not found")
     inp = a.file.read_bytes()
     f = t.judge(inp, 1, None)
     if f is None:
-        print(GREEN(BOLD("✓ Passed")) + f" on {a.file}" + DIM(f"  (wrong {t.max_wrong:.3f}s)"))
+        print(GREEN(BOLD("✓ Passed")) + f" on {rel(a.file)}" + DIM(f"  (wrong {t.max_wrong:.3f}s)"))
         return 0
     report(f, t, debug_build)
     return 1
@@ -608,6 +627,7 @@ def stress(a, t: Tester, debug_build, pool):
         print(YELLOW(f"Stopped after {done} tests") + DIM(f" ({elapsed:.1f}s), all passed"))
         return 130
     if not fails:
+        shutil.rmtree(FAIL, ignore_errors=True)  # an old failure is no longer relevant
         print(GREEN(BOLD(f"✓ All {done} tests passed")) + DIM(f" in {elapsed:.1f}s  (seed {base})"))
         return 0
     # harness problems first (gen / brute / checker), then the smallest input
